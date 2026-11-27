@@ -1,0 +1,38 @@
+name: live
+
+# Daily canary against the real thing: the public search endpoint and the
+# pagination contract. A red run means e-Fresh changed something, not that a
+# mock drifted.
+#
+# No credentials are configured here on purpose. Account checks (cart, delivery)
+# are run by hand with a throwaway EFRESH_CONFIG_DIR, so a fork cannot spend
+# somebody's grocery budget.
+on:
+  schedule:
+    - cron: "30 5 * * *"   # 05:30 UTC = 07:30 Athens (EET) / 08:30 (EEST)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: live smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Live - public search only
+        run: pytest tests/live -m live -v

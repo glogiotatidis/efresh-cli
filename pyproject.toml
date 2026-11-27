@@ -1,0 +1,32 @@
+[project]
+name = "efresh-cli"
+version = "0.1.0"
+description = "e-Fresh.gr login, grocery search, cart and delivery in the terminal, with JSON for agents"
+readme = "README.md"
+license = { text = "GPL-3.0-only" }
+requires-python = ">=3.9"
+# No runtime dependencies: the site's own JSON API is reached with urllib and
+# a Laravel session cookie. Nothing here parses HTML except the CSRF <meta> tag.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+efresh = "efresh_cli.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["efresh_cli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The default run is offline: live tests hit the real site and only run in the
+# scheduled workflow (`pytest -m live`).
+addopts = "-m 'not live'"
+markers = [
+    "live: hits the real www.e-fresh.gr, needs network",
+]

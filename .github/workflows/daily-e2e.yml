@@ -1,0 +1,199 @@
+name: daily e2e
+
+# Authenticated end-to-end canary: login, search, old orders, add to cart, change
+# quantity, remove, restore the delivery slot, logout. The cart is put back the
+# way it was found; the workflow fails if it is not.
+#
+# Configure EFRESH_EMAIL and EFRESH_PASSWORD as repository secrets. Without them
+# the authenticated half is skipped and only the public search runs, so forks do
+# not fail and a fork cannot spend anybody's grocery budget.
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC = 08:00 Athens (EET) / 09:00 (EEST)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-e2e
+  cancel-in-progress: false
+
+jobs:
+  account:
+    name: account e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      EFRESH_EMAIL: ${{ secrets.EFRESH_EMAIL }}
+      EFRESH_PASSWORD: ${{ secrets.EFRESH_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Public search
+        shell: bash
+        run: |
+          set -euo pipefail
+          efresh search sanitas -n 1 > /tmp/search.json
+          jq -e '.count >= 1' /tmp/search.json > /dev/null
+
+      - name: Credentials notice
+        if: env.EFRESH_EMAIL == '' || env.EFRESH_PASSWORD == ''
+        shell: bash
+        run: |
+          echo "::notice::EFRESH_EMAIL / EFRESH_PASSWORD are not configured; account E2E skipped."
+
+      - name: Login
+        if: env.EFRESH_EMAIL != '' && env.EFRESH_PASSWORD != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$EFRESH_PASSWORD" \
+            | efresh auth login --email "$EFRESH_EMAIL" --password-stdin > /dev/null
+          efresh auth status | jq -e '.logged_in == true' > /dev/null
+
+      - name: Old orders
+        if: env.EFRESH_EMAIL != '' && env.EFRESH_PASSWORD != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          efresh orders -n 5 > /tmp/orders.json
+          jq -e '.orders | type == "array"' /tmp/orders.json > /dev/null
+          echo "orders on page: $(jq -r .count /tmp/orders.json)"
+          ORDER_ID=$(jq -r '.orders[0].id // empty' /tmp/orders.json)
+          if [ -n "$ORDER_ID" ]; then
+            efresh order "$ORDER_ID" > /tmp/order.json
+            jq -e '.items | type == "array"' /tmp/order.json > /dev/null
+            echo "order detail items: $(jq -r .item_count /tmp/order.json)"
+          else
+            echo "no past orders on this account; detail check skipped"
+          fi
+
+      - name: Baseline cart and delivery
+        if: env.EFRESH_EMAIL != '' && env.EFRESH_PASSWORD != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          efresh cart > /tmp/cart-before.json
+          efresh delivery > /tmp/delivery-before.json
+          jq -e '.items | type == "array"' /tmp/cart-before.json > /dev/null
+          jq -e 'has("reservation")' /tmp/delivery-before.json > /dev/null
+          echo "cart lines: $(jq -r .item_count /tmp/cart-before.json)"
+
+      - name: Add, change quantity, remove
+        if: env.EFRESH_EMAIL != '' && env.EFRESH_PASSWORD != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          efresh search sanitas -n 50 > /tmp/search.json
+
+          # An available, non-gift product. Gifts are inserted by the site and
+          # must not be touched by this workflow.
+          ID=$(jq -r --slurpfile cart /tmp/cart-before.json '
+            ($cart[0].items | map(select(.promo)) | map(.id)) as $promo
+            | [.results[] | select(.available)
+               | select((.id as $id | $promo | index($id)) == null)][0].id // empty
+          ' /tmp/search.json)
+          test -n "$ID"
+
+          PRIOR=$(jq -r --arg id "$ID" \
+            '([.items[] | select(.id == $id)][0].quantity) // 0' \
+            /tmp/cart-before.json)
+          printf '{"id":"%s","prior":%s}\n' "$ID" "$PRIOR" > /tmp/e2e.json
+
+          efresh cart add "$ID" -q 1 > /tmp/add.json
+          jq -e --arg id "$ID" --argjson want "$((PRIOR + 1))" \
+            '.cart.items[] | select(.id == $id) | .quantity == $want' \
+            /tmp/add.json > /dev/null
+          # The market requires a delivery slot before adding; add must have one.
+          jq -e '.delivery.reservation != null' /tmp/add.json > /dev/null
+
+          efresh cart qty "$ID" "$((PRIOR + 2))" > /tmp/qty.json
+          jq -e --argjson want "$((PRIOR + 2))" \
+            '.resulting_quantity == $want' /tmp/qty.json > /dev/null
+
+          # Delete path: the whole line must disappear. Cleanup puts `PRIOR`
+          # back afterwards (a no-op when the product was not in the cart).
+          efresh cart remove "$ID" > /tmp/remove.json
+          jq -e --arg id "$ID" \
+            '([.cart.items[] | select(.id == $id)] | length) == 0' \
+            /tmp/remove.json > /dev/null
+          jq -e --argjson want "$((PRIOR + 2))" '.removed == $want' \
+            /tmp/remove.json > /dev/null
+
+          echo "add/qty/remove ok for $ID (prior quantity $PRIOR)"
+
+      - name: Restore, verify, logout
+        if: always() && env.EFRESH_EMAIL != '' && env.EFRESH_PASSWORD != ''
+        shell: bash
+        run: |
+          set +e
+          STATUS=0
+          BEFORE_NULL=false
+
+          if [ -f /tmp/e2e.json ] && [ -f /tmp/cart-before.json ]; then
+            ID=$(jq -r .id /tmp/e2e.json)
+            PRIOR=$(jq -r .prior /tmp/e2e.json)
+            # Absolute set: puts an existing line back and removes a new one.
+            efresh cart qty "$ID" "$PRIOR" > /dev/null || STATUS=1
+          fi
+
+          BEFORE_DATE=""
+          BEFORE_SLOT=""
+          if [ -f /tmp/delivery-before.json ]; then
+            BEFORE_NULL=$(jq -r '.reservation == null' /tmp/delivery-before.json)
+            if [ "$BEFORE_NULL" = "true" ]; then
+              # The slot was reserved by this run; leave the account as found.
+              efresh delivery clear > /dev/null || STATUS=1
+            else
+              # A pre-existing slot can be dropped by the cart cycle. Put the
+              # same slot back, then verify the server accepted it.
+              BEFORE_DATE=$(jq -r '.reservation.date' /tmp/delivery-before.json)
+              BEFORE_SLOT=$(jq -r '.reservation.timeslot_id' /tmp/delivery-before.json)
+              BEFORE_ADDR=$(jq -r '.address.id' /tmp/delivery-before.json)
+              efresh delivery set --date "$BEFORE_DATE" --slot "$BEFORE_SLOT" \
+                --address-id "$BEFORE_ADDR" > /tmp/delivery-restore.json || STATUS=1
+              jq -e --arg date "$BEFORE_DATE" --argjson slot "$BEFORE_SLOT" \
+                '.reservation.date == $date and .reservation.timeslot_id == $slot' \
+                /tmp/delivery-restore.json > /dev/null || STATUS=1
+            fi
+          fi
+
+          efresh cart > /tmp/cart-after.json || STATUS=1
+          if [ -f /tmp/cart-before.json ] && [ -f /tmp/cart-after.json ]; then
+            # Never print the lines themselves: this repository is public and a
+            # failure would otherwise publish product ids and quantities.
+            BEFORE_CART=$(jq -cS '[.items[] | {id, quantity}] | sort_by(.id)' \
+              /tmp/cart-before.json) || STATUS=1
+            AFTER_CART=$(jq -cS '[.items[] | {id, quantity}] | sort_by(.id)' \
+              /tmp/cart-after.json) || STATUS=1
+            if [ -n "$BEFORE_CART" ] && [ "$BEFORE_CART" != "$AFTER_CART" ]; then
+              echo "cart differs from baseline"
+              STATUS=1
+            fi
+          fi
+
+          efresh delivery > /tmp/delivery-after.json || STATUS=1
+          if [ "$BEFORE_NULL" = "false" ] && [ -f /tmp/delivery-after.json ]; then
+            jq -e --arg date "$BEFORE_DATE" --argjson slot "$BEFORE_SLOT" \
+              '.reservation != null and .reservation.date == $date and .reservation.timeslot_id == $slot' \
+              /tmp/delivery-after.json > /dev/null || STATUS=1
+          elif [ -f /tmp/delivery-after.json ]; then
+            jq -e '.reservation == null' /tmp/delivery-after.json > /dev/null || STATUS=1
+          fi
+
+          efresh auth logout > /dev/null || STATUS=1
+          if efresh auth status > /dev/null 2>&1; then
+            echo "still logged in after logout"
+            STATUS=1
+          fi
+
+          exit $STATUS
