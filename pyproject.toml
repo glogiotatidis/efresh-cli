@@ -1,7 +1,7 @@
 [project]
 name = "efresh-cli"
 version = "0.1.0"
-description = "e-Fresh.gr login, grocery search, cart and delivery in the terminal, with JSON for agents"
+description = "e-Fresh.gr login, grocery search, cart, delivery and past orders in the terminal, with JSON for agents"
 readme = "README.md"
 license = { text = "GPL-3.0-only" }
 requires-python = ">=3.9"
@@ -14,6 +14,11 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 efresh = "efresh_cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/glogiotatidis/efresh-cli"
+Repository = "https://github.com/glogiotatidis/efresh-cli"
+Issues = "https://github.com/glogiotatidis/efresh-cli/issues"
 
 [build-system]
 requires = ["setuptools>=61.0"]
